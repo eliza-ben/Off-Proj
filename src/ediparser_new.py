@@ -1,0 +1,408 @@
+from __future__ import annotations
+
+import asyncio
+import gzip
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from x12_edi_tools.x12_parser import X12Parser, X12ParserError
+
+
+class OrderedX12Parser(X12Parser):
+    """
+    x12-edi-tools stores parsed data grouped by segment id.
+    For ACT grouping we ALSO need the original segment order.
+    """
+
+    def parse_with_order(self, x12_content: str):
+        segments = self._split_into_segments(x12_content)  # in-order list[str]
+        self._process_segments(segments)
+        self._validate_parsed_data()
+        return segments, dict(self.parsed_data)
+
+
+# -----------------------
+# Data Model
+# -----------------------
+@dataclass
+class Balance:
+    balance_type: Optional[str] = None
+    balance_code: Optional[str] = None
+    amount: Optional[str] = None
+    raw: Optional[str] = None
+
+
+@dataclass
+class ServiceCharge:
+    service_class: Optional[str] = None
+    service_code: Optional[str] = None
+    volume: Optional[str] = None
+    charge_amount: Optional[str] = None
+    rate: Optional[str] = None
+    unit: Optional[str] = None
+    description: Optional[str] = None
+    raw: Optional[str] = None
+
+
+@dataclass
+class Account:
+    account_id: Optional[str] = None
+    account_desc: Optional[str] = None
+    currency: Optional[str] = None
+    ent: Optional[List[str]] = None
+    account_parent: Optional[str] = None
+    rates: Optional[str] = None
+    parties: List[Dict[str, Any]] = field(default_factory=list)
+    balances: List[Balance] = field(default_factory=list)
+    service_charges: List[ServiceCharge] = field(default_factory=list)
+
+
+@dataclass
+class Transaction822:
+    control_number: Optional[str] = None
+    bgn: Optional[List[str]] = None
+    dtm: List[List[str]] = field(default_factory=list)
+    accounts: List[Account] = field(default_factory=list)
+
+
+@dataclass
+class Interchange:
+    isa: Optional[List[str]] = None
+    gs: Optional[List[str]] = None
+    transactions_822: List[Transaction822] = field(default_factory=list)
+    invoice_date: Optional[str] = None
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+
+
+@dataclass
+class EDI822Document:
+    interchanges: List[Interchange] = field(default_factory=list)
+
+
+# -----------------------
+# Separator detection
+# -----------------------
+def detect_separators_from_isa(text: str, isa_pos: int) -> Tuple[str, str, str]:
+    """
+    Element separators can be * or |. This detects the separator in the ISA segment
+    """
+    if isa_pos < 0 or isa_pos + 4 > len(text):
+        raise ValueError("Invalid ISA position for separator detection")
+
+    element_sep = text[isa_pos + 3]
+
+    # Find 16th occurrence of element_sep after 'ISA'
+    count = 0
+    i = isa_pos
+    last_sep_pos = -1
+    while count < 16:
+        j = text.find(element_sep, i + 1)
+        if j == -1:
+            raise ValueError("Could not find 16 element separators inside ISA")
+        last_sep_pos = j
+        i = j
+        count += 1
+
+    if last_sep_pos + 2 >= len(text):
+        raise ValueError("ISA is truncated; cannot read component separator and terminator")
+
+    component_sep = text[last_sep_pos + 1]
+    seg_term = text[last_sep_pos + 2]
+    return element_sep, component_sep, seg_term
+
+
+def split_interchanges(raw_text: str) -> List[str]:
+    """
+    Splitting the Multiple ISA block into interchanges and then processing each interchange.
+    """
+    text = raw_text
+    starts: List[int] = []
+    pos = 0
+    while True:
+        i = text.find("ISA", pos)
+        if i == -1:
+            break
+        starts.append(i)
+        pos = i + 3
+
+    interchanges: List[str] = []
+    for idx, isa_pos in enumerate(starts):
+        _, _, seg_term = detect_separators_from_isa(text, isa_pos)
+
+        iea_pos = text.find("IEA", isa_pos)
+        if iea_pos == -1:
+            end = starts[idx + 1] if idx + 1 < len(starts) else len(text)
+            interchanges.append(text[isa_pos:end].strip())
+            continue
+
+        iea_end = text.find(seg_term, iea_pos)
+        if iea_end == -1:
+            end = starts[idx + 1] if idx + 1 < len(starts) else len(text)
+            interchanges.append(text[isa_pos:end].strip())
+            continue
+
+        interchanges.append(text[isa_pos:iea_end + 1].strip())
+
+    return interchanges
+
+
+def _normalize_isa_newlines(interchange: str, seg_term: str) -> str:
+    """
+    Normalize new lines
+    """
+    i = interchange.find("ISA")
+    if i == -1:
+        return interchange
+    term = interchange.find(seg_term, i)
+    if term == -1:
+        return interchange
+    isa = interchange[i:term + 1].replace("\r", "").replace("\n", "")
+    return interchange[:i] + isa + interchange[term + 1:]
+
+
+def parse_segments_from_interchange(interchange: str) -> List[Dict[str, Any]]:
+    isa_pos = interchange.find("ISA")
+    if isa_pos == -1:
+        raise ValueError("No ISA found in interchange")
+
+    element_sep, _, seg_term = detect_separators_from_isa(interchange, isa_pos)
+    interchange = _normalize_isa_newlines(interchange, seg_term)
+
+    segments: List[Dict[str, Any]] = []
+    for raw_seg in interchange.split(seg_term):
+        raw_seg = raw_seg.strip()
+        if not raw_seg:
+            continue
+        parts = raw_seg.split(element_sep)
+        segments.append({"tag": parts[0].strip(), "elements": parts[1:], "raw": raw_seg})
+    return segments
+
+
+# -----------------------
+# 822 extraction
+# -----------------------
+def _parse_ser(elements: List[str], raw: str) -> ServiceCharge:
+    # Parsing the SER segment
+    sc = ServiceCharge(raw=raw)
+    sc.service_class = elements[0] if len(elements) > 0 else None
+    sc.service_code = elements[1] if len(elements) > 1 else None
+    sc.charge_amount = elements[2] if len(elements) > 2 else None
+    sc.volume = elements[3] if len(elements) > 3 else None
+    sc.unit = elements[4] if len(elements) > 4 else None
+    sc.description = elements[6] if len(elements) > 6 else None
+    return sc
+
+
+def _parse_bln(elements: List[str], raw: str) -> Balance:
+    # Parsing the BLN segment
+    b = Balance(raw=raw)
+    b.balance_type = elements[0] if len(elements) > 0 else None
+    b.balance_code = elements[1] if len(elements) > 1 else None
+    b.amount = elements[-1] if len(elements) > 0 else None
+    return b
+
+
+def normalize_for_x12_edi_tools(interchange: str) -> str:
+    """
+    x12-edi-tools expects standard separators in practice (~ and *).
+    """
+    isa_pos = interchange.find("ISA")
+    if isa_pos == -1:
+        return interchange
+
+    element_sep, _, seg_term = detect_separators_from_isa(interchange, isa_pos)
+    interchange = _normalize_isa_newlines(interchange, seg_term)
+
+    # normalize terminator to '~'
+    if seg_term != "~":
+        interchange = interchange.replace(seg_term, "~")
+
+    # normalize element separator to '*'
+    if element_sep != "*":
+        interchange = interchange.replace(element_sep, "*")
+
+    # avoid accidental double terminators
+    while "~~" in interchange:
+        interchange = interchange.replace("~~", "~")
+
+    return interchange.strip()
+
+
+def extract_822(segments: List[Dict[str, Any]]) -> Interchange:
+    ic = Interchange()
+
+    current_tx: Optional[Transaction822] = None
+    current_ent: Optional[List[str]] = None
+    current_account: Optional[Account] = None
+
+    header_parties: List[Dict[str, Any]] = []
+    ent_parties: List[Dict[str, Any]] = []
+
+    def new_account_from_act(el: List[str]) -> Account:
+        a = Account(
+            ent=current_ent,
+            account_id=(el[0] if len(el) > 0 else None),
+            account_desc=(el[1] if len(el) > 1 else None),
+            account_parent=(el[5] if len(el) > 5 else None),
+        )
+        # inherit parties collected so far (BK/AO etc.)
+        a.parties.extend(header_parties)
+        a.parties.extend(ent_parties)
+        return a
+
+    for seg in segments:
+        tag = seg["tag"]
+        el = seg["elements"]
+
+        if tag == "ISA":
+            ic.isa = el
+
+        elif tag == "GS":
+            ic.gs = el
+
+        elif tag == "ST":
+            if len(el) > 0 and el[0] == "822":
+                current_tx = Transaction822(control_number=(el[1] if len(el) > 1 else None))
+                ic.transactions_822.append(current_tx)
+
+                current_ent = None
+                current_account = None
+                header_parties = []
+                ent_parties = []
+            else:
+                current_tx = None
+                current_ent = None
+                current_account = None
+
+        elif current_tx is not None:
+            if tag == "BGN":
+                current_tx.bgn = el
+
+            elif tag == "DTM":
+                current_tx.dtm.append(el)
+
+                if len(el) > 1:
+                    qual = el[0]
+                    date = el[1]
+
+                if qual == "009":
+                    ic.invoice_date = date
+                elif qual == "150":
+                    ic.from_date = date
+                elif qual == "151":
+                    ic.to_date = date
+
+
+            elif tag == "N1":
+                party = {
+                    "entity_id_code": el[0] if len(el) > 0 else None,
+                    "name": el[1] if len(el) > 1 else None,
+                    "id_code_qual": el[2] if len(el) > 2 else None,
+                    "id_code": el[3] if len(el) > 3 else None,
+                    "raw": seg["raw"],
+                }
+                # before ENT -> header, after ENT (before/after ACT) -> ent_parties
+                if current_ent is None:
+                    header_parties.append(party)
+                else:
+                    ent_parties.append(party)
+                    # also attach to current account if one is active
+                    if current_account is not None:
+                        current_account.parties.append(party)
+
+            elif tag == "ENT":
+                current_ent = el
+                ent_parties = []
+                current_account = None  # next ACT starts a new account
+
+            elif tag == "ACT":
+                current_account = new_account_from_act(el)
+                current_tx.accounts.append(current_account)
+
+            elif tag == "CUR":
+                if current_account is None:
+                    # create placeholder account if CUR arrives before ACT
+                    current_account = Account(ent=current_ent)
+                    current_account.parties.extend(header_parties)
+                    current_account.parties.extend(ent_parties)
+                    current_tx.accounts.append(current_account)
+                current_account.currency = el[1] if len(el) > 1 else current_account.currency
+
+            elif tag == "RTE":
+                if current_account is None:
+                    # create placeholder account if RTE arrives before ACT
+                    current_account = Account(ent=current_ent)
+                    current_account.parties.extend(header_parties)
+                    current_account.parties.extend(ent_parties)
+                    current_tx.accounts.append(current_account)
+                current_account.rates = el[1] if len(el) > 1 else None
+
+            elif tag == "BLN":
+                if current_account is None:
+                    current_account = Account(ent=current_ent)
+                    current_account.parties.extend(header_parties)
+                    current_account.parties.extend(ent_parties)
+                    current_tx.accounts.append(current_account)
+                current_account.balances.append(_parse_bln(el, seg["raw"]))
+
+            elif tag == "SER":
+                if current_account is None:
+                    current_account = Account(ent=current_ent)
+                    current_account.parties.extend(header_parties)
+                    current_account.parties.extend(ent_parties)
+                    current_tx.accounts.append(current_account)
+                current_account.service_charges.append(_parse_ser(el, seg["raw"]))
+
+    return ic
+
+
+def list_account_services(doc) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    # Convert the EDIX12Doc to List of Dict
+    for ic in doc.interchanges:
+        for tx in ic.transactions_822:
+            for acc in tx.accounts:
+                for sc in acc.service_charges:
+                    rows.append({
+                        "invoice_date": ic.invoice_date,
+                        "from_date": ic.from_date,
+                        "to_date": ic.to_date,
+                        "account_id": acc.account_id,
+                        "account_desc": acc.account_desc,
+                        "currency": acc.currency,
+                        "parent_account": acc.account_parent,
+                        "service_code": sc.service_code,
+                        "description": sc.description,
+                        "charge_amount": sc.charge_amount,
+                        "volume": sc.volume,
+                        "units": sc.unit,
+                    })
+    return rows
+
+
+def parse_edi(raw_text) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    doc = EDI822Document()
+    for interchange_text in split_interchanges(raw_text.read()):
+        normalized = normalize_for_x12_edi_tools(interchange_text)
+
+        # x12-edi-tools parse + validation
+        parser = OrderedX12Parser()
+        try:
+            seg_strings, _ = parser.parse_with_order(normalized)
+        except X12ParserError as e:
+            raise ValueError(f"x12-edi-tools could not parse interchange: {e}") from e
+
+        # Build ordered segments for  822 mapper
+        ordered_segments: List[Dict[str, Any]] = []
+        for s in seg_strings:
+            parts = s.split("*")
+            ordered_segments.append({"tag": parts[0].strip(), "elements": parts[1:], "raw": s})
+
+        doc.interchanges.append(extract_822(ordered_segments))
+        # Convert the EDI822Document into list of accounts and services
+        rows = list_account_services(doc)
+    return rows
