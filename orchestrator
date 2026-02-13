@@ -1,0 +1,771 @@
+"""
+Orchestrator Service - Master ETL Job Router and Event Publisher
+
+This service acts as the central orchestration point for all GenFlowCrafter ETL operations,
+routing requests to specialized sub-services and publishing job lifecycle events to Kafka.
+
+Service Port: 8080
+Base URL: http://localhost:8080
+Framework: FastAPI + AsyncIO
+Language: Python 3.11+
+
+Key Features:
+-------------
+1. Job Routing - Routes requests to 5 specialized ETL sub-services
+2. Event Publishing - Publishes job lifecycle events to Kafka
+3. Service Discovery - Abstracts sub-service locations from clients
+4. Audit Trail - Complete tracking of all ETL operations
+5. Error Handling - Centralized error handling and reporting
+
+Supported Job Types:
+--------------------
+1. api-to-db (port 9090) - Ingest from REST APIs to databases
+2. db-to-file (port 9091) - Export databases to files
+3. db-to-db (port 9092) - Transfer between databases
+4. file-to-file (port 9093) - Convert file formats
+5. file-to-db (port 9094) - Import files to databases
+6. file-transfer (port 9095) - Move/rename files
+7. db-to-api (port 9097) - Export databases to REST APIs
+
+Kafka Event Lifecycle:
+----------------------
+1. Job request received
+2. STARTED event published to Kafka
+3. Request routed to sub-service
+4. Sub-service executes job
+5. COMPLETED/FAILED event published to Kafka
+6. Response returned to client
+
+Endpoints:
+----------
+- POST /jobs - Execute ETL job
+- GET /health - Health check
+- GET /metrics - Prometheus metrics
+
+For detailed API documentation, see ORCHESTRATOR_SPECIFICATION.md
+"""
+
+import json
+import os
+import time
+import uuid
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import httpx
+from aiokafka import AIOKafkaProducer
+from aiokafka.helpers import create_ssl_context
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends, Request
+from pydantic import BaseModel, Field
+
+# Load environment variables
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
+
+# Import from shared library
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../libs/py-common"))
+
+from common.auth import verify_jwt_or_basic
+from common.metrics import mount_metrics, OPERATION_LATENCY, record_success, record_error
+from common.tokens import ServiceTokenManager
+from common.logging import (
+    setup_logging,
+    log_external_call,
+    get_correlation_id,
+)
+from common.middleware import add_correlation_middleware
+from common.audit import (
+    setup_audit,
+    publish_audit_event,
+)
+from common.audit_middleware import add_audit_middleware
+from common.security import (
+    add_cors_middleware,
+    create_limiter,
+    add_rate_limiting,
+    add_request_size_limit,
+    STRICT_RATE_LIMIT,
+)
+
+
+SERVICE_NAME = "orchestrator"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+JSON_LOGS = os.getenv("JSON_LOGS", "false").lower() == "true"
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+DEFAULT_DOMAIN_ID = os.getenv("DEFAULT_DOMAIN_ID", "default")
+
+# Setup structured logging
+logger = setup_logging(SERVICE_NAME, LOG_LEVEL, JSON_LOGS)
+
+# Setup audit publisher
+audit_publisher = setup_audit(
+    SERVICE_NAME,
+    default_domain_id=DEFAULT_DOMAIN_ID,
+    kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
+    kafka_audit_topic=os.getenv("KAFKA_AUDIT_TOPIC"),
+    enabled=AUDIT_ENABLED,
+)
+
+# Kafka Configuration
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "etl-events")
+KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
+KAFKA_SASL_USERNAME = os.getenv("KAFKA_SASL_USERNAME", "")
+KAFKA_SASL_PASSWORD = os.getenv("KAFKA_SASL_PASSWORD", "")
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
+KAFKA_SSL_CAFILE = os.getenv("KAFKA_SSL_CAFILE", None)
+
+# Service URLs
+API_TO_DB_URL = os.getenv("API_TO_DB_URL", "http://api-to-db:9090")
+DB_TO_FILE_URL = os.getenv("DB_TO_FILE_URL", "http://db-to-file:9091")
+DB_TO_DB_URL = os.getenv("DB_TO_DB_URL", "http://db-to-db:9092")
+FILE_TO_FILE_URL = os.getenv("FILE_TO_FILE_URL", "http://file-to-file:9093")
+FILE_TO_DB_URL = os.getenv("FILE_TO_DB_URL", "http://file-to-db:9094")
+FILE_TRANSFER_URL = os.getenv("FILE_TRANSFER_URL", "http://file-transfer:9095")
+DB_TO_API_URL = os.getenv("DB_TO_API_URL", "http://db-to-api:9097")
+
+
+app = FastAPI(
+    title="ETL Orchestrator Service",
+    description="Master service that routes requests to ETL sub-services with Kafka event publishing",
+    version="1.0.0",
+)
+
+# ============================================================================
+# SECURITY MIDDLEWARE (Order matters - add security first)
+# ============================================================================
+
+# 1. Request size limit (check before processing)
+add_request_size_limit(app, max_size=10485760)  # 10MB limit
+
+# 2. CORS protection
+add_cors_middleware(app)
+
+# 3. Rate limiting
+limiter = create_limiter()
+add_rate_limiting(app, limiter)
+
+# ============================================================================
+# OBSERVABILITY MIDDLEWARE
+# ============================================================================
+
+# Mount metrics
+mount_metrics(app)
+
+# Add correlation ID middleware
+add_correlation_middleware(app, logger)
+
+# Add audit middleware
+add_audit_middleware(app, SERVICE_NAME, default_domain_id=DEFAULT_DOMAIN_ID)
+
+
+# Enums
+class JobType(str, Enum):
+    API_TO_DB = "api-to-db"
+    DB_TO_FILE = "db-to-file"
+    DB_TO_DB = "db-to-db"
+    FILE_TO_FILE = "file-to-file"
+    FILE_TO_DB = "file-to-db"
+    FILE_TRANSFER = "file-transfer"
+    DB_TO_API = "db-to-api"
+
+
+class JobStatus(str, Enum):
+    STARTED = "STARTED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    RUNNING = "RUNNING"
+
+
+# ============================================================================
+# REQUEST/RESPONSE MODELS
+# ============================================================================
+
+class JobRequest(BaseModel):
+    """
+    Job execution request model.
+    
+    Defines the ETL job to execute including type, payload, and metadata.
+    
+    Fields:
+    -------
+    job_type: Type of ETL job (api-to-db, db-to-file, db-to-db, file-to-file, file-to-db, file-transfer, db-to-api)
+    payload: Job-specific configuration (see sub-service specs for details)
+    job_id: Optional job ID (auto-generated UUID if not provided)
+    metadata: Additional metadata for tracking (user, environment, etc.)
+    
+    Examples:
+    ---------
+    API to Database:
+        {
+            "job_type": "api-to-db",
+            "payload": {...},  # See API_TO_DB_SPECIFICATION.md
+            "job_id": "job-12345",
+            "metadata": {"user": "admin"}
+        }
+    
+    Database to File:
+        {
+            "job_type": "db-to-file",
+            "payload": {...},  # See DB_TO_FILE_SPECIFICATION.md
+            "metadata": {"environment": "production"}
+        }
+    """
+    job_type: JobType = Field(..., description="Type of ETL job to execute")
+    payload: Dict[str, Any] = Field(..., description="Job-specific payload")
+    job_id: Optional[str] = Field(default=None, description="Optional job ID (auto-generated if not provided)")
+    node_runId: Optional[str] = Field(default=None, description="Optional node_runId (auto-generated if not provided)")
+    run_control_id: Optional[str] = Field(default=None, description="Optional run_control_id (auto-generated if not provided)")
+    correlation_id: Optional[str] = Field(default=None, description="Optional correlation_id (auto-generated if not provided)")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
+
+
+class JobResponse(BaseModel):
+    """
+    Job execution response model.
+    
+    Returns the result of job execution including status, result, and timing.
+    
+    Fields:
+    -------
+    job_id: Unique job identifier
+    job_type: Type of ETL job executed
+    status: Job status (STARTED, COMPLETED, FAILED)
+    result: Job result from sub-service (if successful)
+    error: Error message (if failed)
+    duration_ms: Total execution duration in milliseconds
+    started_at: Job start timestamp (ISO 8601)
+    completed_at: Job completion timestamp (ISO 8601)
+    """
+    job_id: str
+    job_type: str
+    status: str
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    duration_ms: int
+    started_at: str
+    completed_at: str
+
+
+class KafkaEvent(BaseModel):
+    eventType: str
+    source: str
+    node_runId: str
+    run_control_id: str
+    correlation_id: str
+    state: JobStatus
+    timestamp: str
+
+
+# ============================================================================
+# KAFKA EVENT PUBLISHER
+# ============================================================================
+
+class KafkaEventPublisher:
+    """
+    Kafka event publisher with SASL authentication and SSL support.
+    
+    Publishes job lifecycle events to Kafka for monitoring and tracking.
+    Supports SASL_SSL authentication with username/password.
+    
+    Features:
+    ---------
+    - SASL authentication (PLAIN, SCRAM)
+    - SSL/TLS encryption
+    - Event compression (gzip)
+    - Guaranteed delivery
+    - Graceful degradation (continues if Kafka unavailable)
+    
+    Event Types:
+    ------------
+    - STARTED: Job execution started
+    - COMPLETED: Job completed successfully
+    - FAILED: Job failed with error
+    
+    Usage:
+    ------
+        publisher = KafkaEventPublisher()
+        await publisher.start()
+        
+        event = KafkaEvent(
+            event_id=str(uuid.uuid4()),
+            job_id="job-123",
+            job_type="api-to-db",
+            status=JobStatus.STARTED,
+            timestamp=datetime.utcnow().isoformat(),
+            metadata={}
+        )
+        
+        await publisher.publish_event(event)
+        await publisher.stop()
+    """
+    
+    def __init__(self):
+        self.producer: Optional[AIOKafkaProducer] = None
+        self.enabled = bool(KAFKA_BOOTSTRAP_SERVERS and KAFKA_BOOTSTRAP_SERVERS.strip())
+    
+    async def start(self):
+        """Initialize Kafka producer."""
+        if not self.enabled:
+            print(f"Kafka disabled - using default bootstrap servers or not configured")
+            return
+        
+        try:
+            # For local development, use simple PLAINTEXT protocol
+            if KAFKA_BOOTSTRAP_SERVERS.startswith("localhost:"):
+                self.producer = AIOKafkaProducer(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+                    security_protocol="PLAINTEXT",
+                    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                    compression_type='gzip',
+                )
+            else:
+                # SSL context for SASL_SSL (production)
+                ssl_context = None
+                if KAFKA_SECURITY_PROTOCOL == "SASL_SSL":
+                    ssl_context = create_ssl_context(cafile=KAFKA_SSL_CAFILE)
+                
+                self.producer = AIOKafkaProducer(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+                    security_protocol=KAFKA_SECURITY_PROTOCOL,
+                    sasl_mechanism=KAFKA_SASL_MECHANISM,
+                    sasl_plain_username=KAFKA_SASL_USERNAME,
+                    sasl_plain_password=KAFKA_SASL_PASSWORD,
+                    ssl_context=ssl_context,
+                    value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                    compression_type='gzip',
+                )
+            await self.producer.start()
+            print(f"Kafka producer started: {KAFKA_BOOTSTRAP_SERVERS}")
+        except Exception as e:
+            print(f"Failed to start Kafka producer: {e}")
+            self.enabled = False
+    
+    async def stop(self):
+        """Stop Kafka producer."""
+        if self.producer:
+            await self.producer.stop()
+    
+    async def publish_event(self, event: KafkaEvent):
+        """Publish event to Kafka."""
+        if not self.enabled or not self.producer:
+            print(f"Kafka event (not published): {event.state} - {event.eventType}")
+            return
+        
+        try:
+            event_dict = event.dict()
+            await self.producer.send_and_wait(
+                KAFKA_TOPIC,
+                value=event_dict,
+                key=event.eventType.encode('utf-8')
+            )
+            print(f"Kafka event published: {event.state} - {event.eventType}")
+        except Exception as e:
+            print(f"Failed to publish Kafka event: {e}")
+
+
+# Global Kafka publisher
+kafka_publisher = KafkaEventPublisher()
+
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info(f"Starting {SERVICE_NAME} service")
+    logger.info(f"Log level: {LOG_LEVEL}, JSON logs: {JSON_LOGS}")
+    logger.info(f"Audit enabled: {AUDIT_ENABLED}")
+    
+    await kafka_publisher.start()
+    
+    if audit_publisher:
+        await audit_publisher.start()
+        logger.info("Audit publisher started")
+    
+    yield
+    
+    # Shutdown
+    logger.info(f"Stopping {SERVICE_NAME} service")
+    await kafka_publisher.stop()
+    
+    if audit_publisher:
+        await audit_publisher.stop()
+        logger.info("Audit publisher stopped")
+
+# Update app with lifespan
+app.router.lifespan_context = lifespan
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+async def publish_start_event(job_id: str, job_type: str, node_runId: str, run_control_id: str, correlation_id: str,  metadata: Dict[str, Any]):
+    """
+    Publish job start event to Kafka.
+    
+    Creates and publishes a STARTED event when a job begins execution.
+    
+    Args:
+        job_id: Unique job identifier
+        job_type: Type of ETL job
+        metadata: Additional metadata (user, environment, etc.)
+    """
+    event = KafkaEvent(
+        eventType=job_type + ".Task." + JobStatus.STARTED + ".v1",
+        source="genesis-gencraft-python",
+        node_runId=node_runId,
+        run_control_id=run_control_id,
+        correlation_id=correlation_id,
+        state=JobStatus.STARTED,
+        timestamp="2025-12-17T21:47:53Z",
+    )
+    await kafka_publisher.publish_event(event)
+
+
+async def publish_end_event(
+    job_id: str,
+    job_type: str,
+    status: JobStatus,
+    node_runId: str, run_control_id: str, correlation_id: str,
+    metadata: Dict[str, Any],
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None
+):
+    """Publish job end event to Kafka."""
+    event = KafkaEvent(
+        eventType=job_type + ".Task." + status + ".v1",
+        source="genesis-gencraft-python",
+        node_runId=node_runId,
+        run_control_id=run_control_id,
+        correlation_id=correlation_id,
+        state=status,
+        timestamp="2025-12-17T21:47:53Z",
+    )
+    await kafka_publisher.publish_event(event)
+
+
+async def route_to_service(
+    job_id,
+    job_type: JobType,
+    node_runId, run_control_id, correlation_id,
+    payload: Dict[str, Any],
+    token_manager: ServiceTokenManager,
+    metadata
+) -> Dict[str, Any]:
+    """Route request to appropriate sub-service."""
+    
+    # Determine target service
+    service_map = {
+        JobType.API_TO_DB: (API_TO_DB_URL, "/ingest/jsonpull"),
+        JobType.DB_TO_FILE: (DB_TO_FILE_URL, "/export/dbtofile"),
+        JobType.DB_TO_DB: (DB_TO_DB_URL, "/transfer"),
+        JobType.FILE_TO_FILE: (FILE_TO_FILE_URL, "/convert"),
+        JobType.FILE_TO_DB: (FILE_TO_DB_URL, "/ingest/fileload"),
+        JobType.FILE_TRANSFER: (FILE_TRANSFER_URL, "/transfer"),
+        JobType.DB_TO_API: (DB_TO_API_URL, "/export/dbpush"),
+    }
+    
+    if job_type not in service_map:
+        raise HTTPException(status_code=400, detail=f"Unknown job type: {job_type}")
+    
+    base_url, endpoint = service_map[job_type]
+    url = f"{base_url}{endpoint}"
+    
+    logger.info(f"Routing to service: {job_type.value} at {url}")
+
+    # Publish RUNNING event (RUNNING)
+    await publish_end_event(
+        job_id,
+        job_type,
+        JobStatus.RUNNING,
+        node_runId, run_control_id, correlation_id, metadata
+    )
+    
+    # Get service token
+    headers = await token_manager.get_auth_header()
+    headers["Content-Type"] = "application/json"
+    
+    # CRITICAL: Propagate correlation ID to downstream service
+    correlation_id = get_correlation_id()
+    if correlation_id:
+        headers["X-Correlation-ID"] = correlation_id
+        logger.info(f"Propagating Domain Id, correlation ID to {job_type.value}: {correlation_id}")
+    
+    # Call sub-service
+    call_start = time.time()
+    async with httpx.AsyncClient(timeout=300) as client:
+
+        response = await client.post(url, json=payload, headers=headers)
+        call_duration = (time.time() - call_start) * 1000
+        
+        # Log external call
+        log_external_call(
+            logger,
+            job_type.value,
+            endpoint,
+            call_duration,
+            response.status_code == 200,
+            status_code=response.status_code,
+        )
+        
+        # Audit external call
+        await publish_audit_event(
+            domain_id=DEFAULT_DOMAIN_ID,
+            entity_type="SERVICE",
+            entity_id=job_type.value,
+            event_type="EXTERNAL_CALL",
+            outcome="SUCCESS" if response.status_code == 200 else "FAILURE",
+            details=f"Called {job_type.value} service at {endpoint}",
+            payload={
+                "operation": endpoint,
+                "duration_ms": call_duration,
+                "status_code": response.status_code,
+            },
+            metadata={
+                "service": job_type.value,
+                "url": url,
+            },
+        )
+        
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Sub-service error: {response.text}"
+            )
+        
+        return response.json()
+
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    """Health check endpoint."""
+    logger.debug("Health check requested")
+    kafka_status = "enabled" if kafka_publisher.enabled else "disabled"
+    audit_status = "enabled" if AUDIT_ENABLED else "disabled"
+    return {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "correlation_id": get_correlation_id(),
+        "kafka": kafka_status,
+        "audit": audit_status,
+    }
+
+
+@app.post("/jobs", response_model=JobResponse)
+@limiter.limit(STRICT_RATE_LIMIT)  # 10 requests per minute
+async def execute_job(
+    request: Request,  # Required by SlowAPI for rate limiting
+    req: JobRequest,
+    auth: Dict = Depends(verify_jwt_or_basic),
+) -> JobResponse:
+    """
+    Execute ETL job by routing to appropriate sub-service.
+    
+{{ ... }}
+    
+    Flow:
+    1. Generate job ID
+    2. Publish START event to Kafka
+    3. Route to sub-service
+    4. Publish END event to Kafka (success or failure)
+    5. Return result
+    """
+    start_time = time.time()
+    started_at = datetime.utcnow().isoformat()
+    
+    # Generate job ID
+    job_id = req.job_id or str(uuid.uuid4())
+    node_runId = req.node_runId or str(uuid.uuid4())
+    run_control_id = req.run_control_id or str(uuid.uuid4())
+    correlation_id = req.correlation_id or str(uuid.uuid4())
+
+    logger.info(
+        f"Executing job: {req.job_type.value} (job_id={job_id})",
+        extra={
+            "extra_fields": {
+                "job_id": job_id,
+                "job_type": req.job_type.value,
+                "user": auth.get("subject") or auth.get("username"),
+            }
+        }
+    )
+    
+    # Prepare metadata
+    metadata = {
+        **req.metadata,
+        "user": auth.get("subject") or auth.get("username"),
+        "auth_type": auth.get("type"),
+        "correlation_id": get_correlation_id(),
+    }
+    
+    with OPERATION_LATENCY.labels(service=SERVICE_NAME, operation="execute").time():
+        try:
+            # Publish START event
+            await publish_start_event(job_id, req.job_type.value, node_runId, run_control_id, correlation_id, metadata)
+            
+            # Initialize token manager
+            token_manager = ServiceTokenManager(
+                client_id=SERVICE_NAME,
+                client_secret=None,  # Auto-fetched from gateway
+                audience="etl-services"
+            )
+            
+            # Route to sub-service
+            result = await route_to_service(
+                job_id,
+                req.job_type,
+                node_runId, run_control_id, correlation_id,
+                req.payload,
+                token_manager,
+                metadata
+            )
+
+
+            # Calculate duration
+            duration_ms = int((time.time() - start_time) * 1000)
+            completed_at = datetime.utcnow().isoformat()
+            
+            # Publish END event (success)
+            await publish_end_event(
+                job_id,
+                req.job_type.value,
+                JobStatus.COMPLETED,
+                node_runId, run_control_id, correlation_id,
+                metadata,
+                result=result
+            )
+            
+            # Metrics
+            record_success(SERVICE_NAME, req.job_type.value, 1)
+            
+            return JobResponse(
+                job_id=job_id,
+                job_type=req.job_type.value,
+                status="COMPLETED",
+                result=result,
+                duration_ms=duration_ms,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        
+        except HTTPException as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            completed_at = datetime.utcnow().isoformat()
+            
+            # Publish END event (failure)
+            await publish_end_event(
+                job_id,
+                req.job_type.value,
+                JobStatus.FAILED,
+                node_runId, run_control_id, correlation_id,
+                metadata,
+                error=str(e.detail)
+            )
+            
+            # Metrics
+            record_error(SERVICE_NAME, req.job_type.value, "HTTPException")
+            
+            return JobResponse(
+                job_id=job_id,
+                job_type=req.job_type.value,
+                status="FAILED",
+                error=str(e.detail),
+                duration_ms=duration_ms,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        
+        except Exception as e:
+            duration_ms = int((time.time() - start_time) * 1000)
+            completed_at = datetime.utcnow().isoformat()
+            
+            # Publish END event (failure)
+            await publish_end_event(
+                job_id,
+                req.job_type.value,
+                JobStatus.FAILED,
+                node_runId, run_control_id, correlation_id,
+                metadata,
+                error=str(e)
+            )
+            
+            # Metrics
+            record_error(SERVICE_NAME, req.job_type.value, type(e).__name__)
+            
+            return JobResponse(
+                job_id=job_id,
+                job_type=req.job_type.value,
+                status="FAILED",
+                error=str(e),
+                duration_ms=duration_ms,
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+
+
+@app.get("/services")
+async def list_services() -> Dict[str, Any]:
+    """List all available ETL services and their endpoints."""
+    return {
+        "services": [
+            {
+                "type": "api-to-db",
+                "description": "Ingest from HTTP APIs to Database",
+                "url": API_TO_DB_URL,
+                "endpoint": "/ingest/jsonpull"
+            },
+            {
+                "type": "db-to-file",
+                "description": "Export Database to File",
+                "url": DB_TO_FILE_URL,
+                "endpoint": "/export/dbtofile"
+            },
+            {
+                "type": "db-to-db",
+                "description": "Transfer data between Databases",
+                "url": DB_TO_DB_URL,
+                "endpoint": "/transfer"
+            },
+            {
+                "type": "file-to-file",
+                "description": "Convert files between formats",
+                "url": FILE_TO_FILE_URL,
+                "endpoint": "/convert"
+            },
+            {
+                "type": "file-to-db",
+                "description": "Import files to Database",
+                "url": FILE_TO_DB_URL,
+                "endpoint": "/ingest/fileload"
+            },
+            {
+                "type": "file-transfer",
+                "description": "Transfer files with renaming and routing",
+                "url": FILE_TRANSFER_URL,
+                "endpoint": "/transfer"
+            },
+            {
+                "type": "db-to-api",
+                "description": "Export Database to REST API",
+                "url": DB_TO_API_URL,
+                "endpoint": "/export/dbpush"
+            }
+        ],
+        "kafka": {
+            "enabled": kafka_publisher.enabled,
+            "bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS if kafka_publisher.enabled else None,
+            "topic": KAFKA_TOPIC if kafka_publisher.enabled else None
+        }
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "9000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
