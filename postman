@@ -1,0 +1,221 @@
+file to db
+curl --location 'http://localhost:9000/jobs' \
+--header 'X-Correlation-ID: py-api-to-db-test002' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Basic YWRtaW46YWRtaW4xMjM=' \
+--data '{
+  "job_type": "file-to-db",
+  "job_id": "test-file-to-db",
+  "payload": {
+    "file": {
+      "file_type": "csv",
+      "file_path": "C:\\Users\\chatham_summary.csv",
+      "delimiter": ",",
+      "quotechar": "\"",
+      "has_header": true,
+      "encoding": "utf-8"
+ 
+    },
+ 
+    "db": {
+      "sqlalchemy_url": "",
+      "schema_name": "",
+      "table_name": ""
+    },
+ 
+    "source_avro_schema": {
+      "type": "record",
+      "name": "chatham_source",
+      "fields": [
+        { "name": "counterpartyasofreportend", "type": ["null", "string"] },
+        { "name": "reportstartdate", "type": ["null", "string"] },
+        { "name": "reportenddate", "type": ["null", "string"] },
+        { "name": "chathamreferencenumber", "type": ["null", "string"] },
+        { "name": "total_borrowertrade", "type": ["null","string"] },
+        { "name": "trade_count", "type": ["null", "string"] }
+      ]
+    },
+ 
+    "target_avro_schema": {
+      "type": "record",
+      "name": "chatham_target",
+      "fields": [
+        { "name": "counterpartyasofreportend", "type": ["null", "string"]},
+        { "name": "reportstartdate", "type": ["null", "string"] },
+        { "name": "reportenddate", "type": ["null", "string"] },
+        { "name": "chathamreferencenumber", "type": ["null", "string"] },
+        { "name": "total_borrowertrade", "type": ["null", "string"] },
+        { "name": "trade_count", "type": ["null", "string"]}
+      ]
+    },
+ 
+    "mapping": [
+      { "source": "counterpartyasofreportend", "target": "counterpartyasofreportend" },
+      { "source": "reportstartdate", "target": "reportstartdate" },
+      { "source": "reportenddate", "target": "reportenddate" },
+      { "source": "chathamreferencenumber", "target": "chathamreferencenumber" },
+      { "source": "total_borrowertrade", "target": "total_borrowertrade" },
+      { "source": "trade_count", "target": "trade_count"}
+    ]
+  }
+}'
+
+
+file to file 
+curl --location 'http://localhost:9000/jobs' \
+--header 'X-Correlation-ID: py-api-to-db-test002' \
+--header 'Content-Type: application/json' \
+--header 'Authorization: Basic YWRtaW46YWRtaW4xMjM=' \
+--data '{
+    "job_type": "file-to-file",
+    "job_id": "test-file-to-file",
+    "payload": {
+        "source": {
+            "type": "csv",
+            "path": "C:\\Users\\FRR56\\PycharmProjects\\genesis\\chatham_summary.csv",
+            "header": true,
+            "delimiter": ",",
+            "quotechar": "\"",
+            "has_header": true,
+            "newline": "\n",
+            "compress": false,
+            "null_literal": "",
+            "encoding": "utf-8",
+            "skip_lines": 0
+        },
+        "target": {
+            "type": "tsv",
+            "path": "C:\\Users\\FRR56\\PycharmProjects\\genesis\\chatham_summary_psv.txt",
+            "header": true,
+            "delimiter": "|",
+            "quotechar": "\"",
+            "has_header": true,
+            "newline": "\n",
+            "compress": false,
+            "null_literal": "",
+            "encoding": "utf-8"
+        },
+        "source_avro_schema": {
+            "type": "record",
+            "name": "chatham_source",
+            "fields": [
+                {
+                    "name": "counterpartyasofreportend",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "reportstartdate",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "reportenddate",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "chathamreferencenumber",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "total_borrowertrade",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "trade_count",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                }
+            ]
+        },
+        "target_avro_schema": {
+            "type": "record",
+            "name": "chatham_target",
+            "fields": [
+                {
+                    "name": "counterpartyasofreportend",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "reportstartdate",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "reportenddate",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "chathamreferencenumber",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "total_borrowertrade",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                },
+                {
+                    "name": "trade_count",
+                    "type": [
+                        "null",
+                        "string"
+                    ]
+                }
+            ]
+        },
+        "mapping": [
+            {
+                "source": "counterpartyasofreportend",
+                "target": "counterpartyasofreportend"
+            },
+            {
+                "source": "reportstartdate",
+                "target": "reportstartdate"
+            },
+            {
+                "source": "reportenddate",
+                "target": "reportenddate"
+            },
+            {
+                "source": "chathamreferencenumber",
+                "target": "chathamreferencenumber"
+            },
+            {
+                "source": "total_borrowertrade",
+                "target": "total_borrowertrade"
+            },
+            {
+                "source": "trade_count",
+                "target": "trade_count"
+            }
+        ]
+    }
+}'
