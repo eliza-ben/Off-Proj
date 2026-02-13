@@ -1,0 +1,155 @@
+"""
+ETL Pipeline Processor - Generic Pipeline Orchestration
+
+This module provides a standardized ETL pipeline that all GenFlowCrafter services use
+for consistent data processing with validation and transformation.
+
+Key Features:
+-------------
+1. Source Validation - Avro schema validation before processing
+2. Column Mapping - Map source fields to target fields with defaults
+3. JOLT Transformation - Apply complex data transformations
+4. Target Validation - Avro schema validation after processing
+5. Batch Processing - Utilities for processing data in batches
+
+Usage:
+------
+    from common.processors import ETLPipeline
+    
+    processed = await ETLPipeline.process_batch(
+        records,
+        source_schema=source_schema,
+        target_schema=target_schema,
+        jolt_spec=jolt_spec,
+        mapping=mapping
+    )
+
+Benefits:
+---------
+- Consistent data processing across all services
+- Automatic validation at each stage
+- Error handling and reporting
+- Memory-efficient batch processing
+"""
+
+from typing import Any, Dict, List, Optional, Callable, AsyncIterator
+from ..avro import validate_batch_list
+from ..jolt import JoltClient
+from ..aggregation import AggregationConfig, AggregationProcessor
+
+
+class ETLPipeline:
+    """Generic ETL pipeline with Avro validation and JOLT transformation."""
+    
+    @staticmethod
+    async def process_batch(
+        records: List[Dict[str, Any]],
+        source_schema: Optional[Dict[str, Any]] = None,
+        target_schema: Optional[Dict[str, Any]] = None,
+        jolt_spec: Optional[List[Dict[str, Any]]] = None,
+        mapping: Optional[List[Dict[str, str]]] = None,
+        jolt_client: Optional[JoltClient] = None,
+        aggregation_config: Optional[AggregationConfig] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Process a batch through standard ETL pipeline.
+        
+        Pipeline stages:
+        1. Source Avro validation (if source_schema provided)
+        2. Apply column mapping (if mapping provided)
+        3. JOLT transformation (if jolt_spec provided)
+        4. Data aggregation and grouping (if aggregation_config provided)
+        5. Target Avro validation (if target_schema provided)
+        
+        Args:
+            records: List of records to process
+            source_schema: Optional Avro schema for source validation
+            target_schema: Optional Avro schema for target validation
+            jolt_spec: Optional JOLT transformation spec
+            mapping: Optional column mappings [{"source": "col1", "target": "col2", "default": None}]
+            jolt_client: Optional JoltClient instance (created if needed)
+            aggregation_config: Optional aggregation configuration for grouping and aggregation
+        
+        Returns:
+            Processed records
+        """
+        # Stage 1: Source Avro validation
+        if source_schema:
+            validate_batch_list(records, source_schema)
+
+        # Stage 2: Apply column mapping
+        if mapping:
+            mapped_records = []
+            for record in records:
+                mapped_record = {}
+                for m in mapping:
+                    value = record.get(m.get("source"))
+                    if value is None and m.get("default") is not None:
+                        value = m.get("default")
+                    mapped_record[m.get("target")] = value
+                mapped_records.append(mapped_record)
+            records = mapped_records
+        
+        # Stage 3: JOLT transformation
+        if jolt_spec:
+            if not jolt_client:
+                jolt_client = JoltClient()
+            records = await jolt_client.transform(records, jolt_spec)
+            if isinstance(records, dict):
+                records = [records]
+        
+        # Stage 4: Data aggregation and grouping
+        if aggregation_config:
+            aggregation_processor = AggregationProcessor()
+            records = await aggregation_processor.aggregate(records, aggregation_config)
+        
+        # Stage 5: Target Avro validation
+        if target_schema:
+            validate_batch_list(records, target_schema)
+        
+        return records
+
+
+class BatchProcessor:
+    """Utilities for batch processing."""
+    
+    @staticmethod
+    async def batch_iterator(
+        items: List[Any],
+        batch_size: int
+    ) -> AsyncIterator[List[Any]]:
+        """
+        Yield batches from a list of items.
+        
+        Args:
+            items: List of items to batch
+            batch_size: Size of each batch
+        
+        Yields:
+            Batches of items
+        """
+        for i in range(0, len(items), batch_size):
+            yield items[i:i + batch_size]
+    
+    @staticmethod
+    async def process_in_batches(
+        items: List[Any],
+        processor_func: Callable,
+        batch_size: int
+    ) -> List[Any]:
+        """
+        Process items in batches using a processor function.
+        
+        Args:
+            items: List of items to process
+            processor_func: Async function to process each batch
+            batch_size: Size of each batch
+        
+        Returns:
+            All processed results
+        """
+        results = []
+        async for batch in BatchProcessor.batch_iterator(items, batch_size):
+            batch_results = await processor_func(batch)
+            results.extend(batch_results)
+        return results
