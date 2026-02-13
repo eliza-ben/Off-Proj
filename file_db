@@ -1,0 +1,878 @@
+"""
+File-to-DB ETL Service - Production-Ready File Ingestion Microservice
+
+This service reads data from files (CSV, TSV, JSON, Parquet) and loads it into relational databases with:
+- Full temporal tracking (SCD Type 2 pattern)
+- Audit trail via Kafka
+- JOLT transformation support
+- Avro schema validation
+- Multiple file format support
+- Batch processing for large files
+- Multi-database support (PostgreSQL, MySQL, Oracle, SQL Server)
+
+Service Port: 9094
+Base URL: http://localhost:9094
+Framework: FastAPI + AsyncIO
+Language: Python 3.11+
+
+Key Features:
+-------------
+1. File Reading
+   - CSV/TSV with configurable delimiters
+   - JSON (single object or array of objects)
+   - Parquet files
+   - Gzip compressed files
+   - Custom encoding support
+   - Header detection
+   - Streaming for large files
+
+2. Database Writing
+   - PostgreSQL (optimized with asyncpg)
+   - MySQL, Oracle, SQL Server support
+   - Batch inserts (configurable batch size)
+   - Upsert mode (INSERT...ON CONFLICT)
+   - Auto-commit transactions
+   - Connection pooling
+
+3. Data Transformation
+   - JOLT transformation integration
+   - Avro schema validation
+   - Column mapping and type conversion
+   - Null handling and default values
+
+4. Temporal Data Management
+   - asof_date: Temporal tracking by date
+   - active flag: Soft delete pattern
+   - correlation_id: Full data lineage
+   - Record deactivation before insert
+
+5. Audit & Observability
+   - Kafka audit events
+   - Structured JSON logging
+   - Correlation ID tracking
+   - Prometheus metrics
+
+6. Security
+   - JWT token validation
+   - Basic authentication support
+   - User attribution in audit trail
+
+Endpoints:
+----------
+- POST /ingest/fileload - Main file ingestion endpoint
+- GET /health - Health check
+- GET /metrics - Prometheus metrics
+
+For detailed API documentation, see FILE_TO_DB_SPECIFICATION.md
+"""
+
+import os
+import sys
+import time
+import csv
+import json
+import gzip
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy import Table
+from dotenv import load_dotenv
+
+# Import from shared library
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../libs/py-common"))
+
+# Load environment variables from local .env (if present)
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env", override=False)
+
+from common.auth import verify_jwt_or_basic
+from common.db import async_engine, reflect_table, normalize_column_names_for_table, create_case_sensitive_column_mapping
+from common.jolt import JoltClient
+from common.metrics import mount_metrics, OPERATION_LATENCY, record_success, record_error, record_batch
+from common.ids import validate_ident
+from common.processors import ETLPipeline, DatabaseWriterFactory, TemporalDataProcessor
+from common.aggregation import AggregationConfig
+from common.logging import setup_logging, log_with_context, log_database_operation, log_error, get_correlation_id
+from common.middleware import add_correlation_middleware
+from common.audit import setup_audit, publish_audit_event
+from common.audit_middleware import add_audit_middleware
+from common.security import (
+    add_cors_middleware,
+    create_limiter,
+    add_rate_limiting,
+    add_request_size_limit,
+    STRICT_RATE_LIMIT,
+)
+
+# CYBERARK-INTEGRATION: placeholder credential resolver
+from common.creds import CredentialSource, resolve_password_in_db_url
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+SERVICE_NAME = "file-to-db"
+SERVICE_PORT = int(os.getenv("PORT", "9094"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+JSON_LOGS = os.getenv("JSON_LOGS", "false").lower() == "true"
+JOLT_SERVICE_URL = os.getenv("JOLT_SERVICE_URL", "http://localhost:8089/transform")
+SECURITY_BASE_URL = os.getenv("SECURITY_BASE_URL", "http://localhost:8088")
+DEFAULT_DOMAIN_ID = "file-to-db-domain"
+
+# Rate limiting
+STRICT_RATE_LIMIT = "10/minute"
+
+# Audit configuration
+AUDIT_ENABLED = os.getenv("AUDIT_ENABLED", "true").lower() == "true"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092")
+KAFKA_AUDIT_TOPIC = os.getenv("KAFKA_AUDIT_TOPIC", "audit-events")
+
+# CYBERARK-INTEGRATION: credential configuration controlled by orchestrator
+CREDENTIAL_SOURCE = os.getenv("CREDENTIAL_SOURCE", "eso").strip().lower()
+CREDENTIAL_SERVICE_URL = os.getenv("CREDENTIAL_SERVICE_URL", "").strip()
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logger = setup_logging(SERVICE_NAME, LOG_LEVEL, JSON_LOGS)
+
+# Setup audit publisher
+audit_publisher = setup_audit(
+    SERVICE_NAME,
+    default_domain_id=DEFAULT_DOMAIN_ID,
+    kafka_bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS"),
+    kafka_audit_topic=os.getenv("KAFKA_AUDIT_TOPIC"),
+    enabled=AUDIT_ENABLED,
+)
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+app = FastAPI(
+    title="File-to-DB ETL Service",
+    description="Production-ready file ingestion microservice with temporal tracking and audit trail",
+    version="1.0.0",
+)
+
+# ============================================================================
+# SECURITY MIDDLEWARE (Order Matters - add security first)
+# ============================================================================
+
+# 1. Request size limit (check before processing)
+add_request_size_limit(app, max_size=10485760)  # 10MB limit
+
+# 2. CORS protection
+add_cors_middleware(app)
+
+# 3. Rate limiting
+limiter = create_limiter()
+add_rate_limiting(app, limiter)
+
+# Add correlation ID middleware
+add_correlation_middleware(app, logger)
+
+# Add audit middleware
+add_audit_middleware(app, SERVICE_NAME, DEFAULT_DOMAIN_ID)
+
+# Mount Prometheus metrics
+mount_metrics(app)
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address, storage_uri="memory://")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
+class FileConfig(BaseModel):
+    """File configuration for reading data."""
+    file_path: str = Field(..., description="Absolute path to the file to read")
+    file_type: str = Field(..., description="File type: csv, tsv, json, parquet, fixed")
+    encoding: str = Field(default="utf-8", description="File encoding")
+    delimiter: Optional[str] = Field(default=None, description="Delimiter for CSV/TSV (auto-detected if not provided)")
+    has_header: bool = Field(default=True, description="Whether file has header row")
+    compressed: bool = Field(default=False, description="Whether file is gzip compressed")
+    json_path: Optional[str] = Field(default=None, description="JSONPath for extracting data from JSON (e.g., $.data)")
+    field_widths: Optional[List[int]] = Field(default=None, description="Column widths for fixed-width files")
+    field_names: Optional[List[str]] = Field(default=None, description="Column names for fixed-width files (if no header)")
+
+
+class DBConfig(BaseModel):
+    """
+    Database configuration with temporal tracking support.
+    
+    Temporal Fields:
+    ----------------
+    - asof_date: Track data as of specific date
+    - active: Soft delete flag for versioning
+    - correlation_id: Data lineage tracking
+    - deactivate_filter: Criteria for deactivating old records
+    
+    Examples:
+    ---------
+    Basic configuration:
+        {
+            "sqlalchemy_url": "postgresql://user:pass@localhost:5432/db",
+            "table_name": "my_table"
+        }
+    
+    With temporal tracking:
+        {
+            "sqlalchemy_url": "postgresql://user:pass@localhost:5432/db",
+            "table_name": "my_table",
+            "asof_date": "2025-10-12",
+            "asof_date_column": "asof_date",
+            "active_column": "active",
+            "correlation_id_column": "correlation_id",
+            "deactivate_filter": {"asof_date": "2025-10-12"}
+        }
+    """
+    sqlalchemy_url: str = Field(..., description="SQLAlchemy database URL")
+    schema_name: Optional[str] = Field(default=None, description="Database schema name")
+    table_name: str = Field(..., description="Target table name")
+    batch_size: int = Field(default=1000, description="Batch size for inserts")
+    upsert_mode: bool = Field(default=False, description="Use upsert (INSERT...ON CONFLICT)")
+    upsert_key: Optional[str] = Field(default=None, description="Unique key for upsert")
+    
+    # Temporal tracking fields
+    asof_date: Optional[str] = Field(default=None, description="As-of date for temporal tracking (YYYY-MM-DD)")
+    asof_date_column: Optional[str] = Field(default="asof_date", description="Column name for as-of date")
+    active_column: Optional[str] = Field(default="active", description="Column name for active flag")
+    correlation_id_column: Optional[str] = Field(default="correlation_id", description="Column name for correlation ID")
+    deactivate_filter: Optional[Dict[str, Any]] = Field(default=None, description="Filter criteria for deactivation")
+
+
+class ColumnMapping(BaseModel):
+    """Column mapping configuration."""
+    source: str = Field(..., description="Source column name from file")
+    target: str = Field(..., description="Target column name in database")
+    type: str = Field(default="string", description="Data type: string, int, float, decimal, date, datetime, boolean")
+    format: Optional[str] = Field(default=None, description="Format string for dates/decimals")
+    default_value: Any = Field(default=None, description="Default value if source is null")
+
+
+class IngestRequest(BaseModel):
+    """Request model for file ingestion."""
+    version: str = Field(default="1.0", description="API version")
+    file: FileConfig
+    db: DBConfig
+    mapping: List[ColumnMapping] = Field(..., description="Column mappings")
+    jolt_spec: Optional[List[Dict[str, Any]]] = Field(default=None, description="Optional JOLT transformation")
+    aggregation_config: Optional[AggregationConfig] = Field(default=None, description="🆕 Optional data aggregation and grouping configuration")
+    source_avro_schema: Optional[Dict[str, Any]] = Field(default=None, description="Avro schema for source validation")
+    target_avro_schema: Optional[Dict[str, Any]] = Field(default=None, description="Avro schema for target validation (optional - can be auto-generated from target table)")
+    asof_date: Optional[str] = Field(default=None, description="As-of date for temporal tracking (YYYY-MM-DD)")
+    correlation_id: Optional[str] = Field(default=None, description="Correlation ID for tracking")
+
+
+class IngestResponse(BaseModel):
+    """Response model for successful ingestion."""
+    status: str = "success"
+    records: int
+    duration_ms: int
+    correlation_id: str
+    asof_date: str
+
+
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    logger.info(f"Starting {SERVICE_NAME} service on port {os.getenv('PORT', '9091')}")
+    logger.info(f"Log level: {LOG_LEVEL}, JSON logs: {JSON_LOGS}")
+    logger.info(f"Security gateway: {os.getenv('SECURITY_BASE_URL', 'http://security-gateway:8088')}")
+
+    if audit_publisher:
+        await audit_publisher.start()
+        logger.info("Audit publisher started")
+
+    yield
+
+    # Shutdown
+    logger.info(f"Stopping {SERVICE_NAME} service")
+    if audit_publisher:
+        await audit_publisher.stop()
+        logger.info("Audit publisher stopped")
+
+
+# Update app with lifespan
+app.router.lifespan_context = lifespan
+
+# ============================================================================
+# FILE READING FUNCTIONS
+# ============================================================================
+
+async def read_csv_file(file_config: FileConfig) -> List[Dict[str, Any]]:
+    """Read CSV/TSV file and return list of dictionaries."""
+    records = []
+    file_path = Path(file_config.file_path)
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=400, detail=f"File not found: {file_config.file_path}")
+    
+    # Determine delimiter
+    delimiter = file_config.delimiter
+    if not delimiter:
+        delimiter = "," if file_config.file_type == "csv" else "\t"
+    
+    # Open file (with gzip if compressed)
+    if file_config.compressed:
+        file_handle = gzip.open(file_path, 'rt', encoding=file_config.encoding)
+    else:
+        file_handle = open(file_path, 'r', encoding=file_config.encoding)
+    
+    try:
+        reader = csv.DictReader(file_handle, delimiter=delimiter) if file_config.has_header else csv.reader(file_handle, delimiter=delimiter)
+        
+        if file_config.has_header:
+            for row in reader:
+                records.append(dict(row))
+        else:
+            # Generate column names: col_0, col_1, col_2, ...
+            for row in reader:
+                record = {f"col_{i}": value for i, value in enumerate(row)}
+                records.append(record)
+    finally:
+        file_handle.close()
+    
+    return records
+
+
+async def read_json_file(file_config: FileConfig) -> List[Dict[str, Any]]:
+    """Read JSON file and return list of dictionaries."""
+    file_path = Path(file_config.file_path)
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=400, detail=f"File not found: {file_config.file_path}")
+    
+    # Open file (with gzip if compressed)
+    if file_config.compressed:
+        file_handle = gzip.open(file_path, 'rt', encoding=file_config.encoding)
+    else:
+        file_handle = open(file_path, 'r', encoding=file_config.encoding)
+    
+    try:
+        data = json.load(file_handle)
+        
+        # Extract data using JSONPath if specified
+        if file_config.json_path:
+            from jsonpath_ng import parse
+            jsonpath_expr = parse(file_config.json_path)
+            matches = [match.value for match in jsonpath_expr.find(data)]
+            if matches:
+                data = matches[0] if len(matches) == 1 else matches
+        
+        # Ensure data is a list
+        if isinstance(data, dict):
+            return [data]
+        elif isinstance(data, list):
+            return data
+        else:
+            raise HTTPException(status_code=400, detail="JSON data must be an object or array")
+    finally:
+        file_handle.close()
+
+
+async def read_fixed_width_file(file_config: FileConfig) -> List[Dict[str, Any]]:
+    """Read fixed-width file and return list of dictionaries."""
+    records = []
+    file_path = Path(file_config.file_path)
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=400, detail=f"File not found: {file_config.file_path}")
+    
+    if not file_config.field_widths:
+        raise HTTPException(status_code=400, detail="field_widths required for fixed-width files")
+    
+    # Open file (with gzip if compressed)
+    if file_config.compressed:
+        file_handle = gzip.open(file_path, 'rt', encoding=file_config.encoding)
+    else:
+        file_handle = open(file_path, 'r', encoding=file_config.encoding)
+    
+    try:
+        lines = file_handle.readlines()
+        
+        # Get field names from header or use provided names
+        if file_config.has_header and lines:
+            header_line = lines[0].strip()
+            # Parse header using field widths
+            field_names = []
+            start = 0
+            for width in file_config.field_widths:
+                field_name = header_line[start:start+width].strip()
+                field_names.append(field_name)
+                start += width
+            lines = lines[1:]  # Skip header
+        elif file_config.field_names:
+            field_names = file_config.field_names
+        else:
+            # Generate column names: col_0, col_1, col_2, ...
+            field_names = [f"col_{i}" for i in range(len(file_config.field_widths))]
+        
+        # Parse data lines
+        for line in lines:
+            if not line.strip():
+                continue
+            
+            record = {}
+            start = 0
+            for i, width in enumerate(file_config.field_widths):
+                value = line[start:start+width].strip()
+                record[field_names[i]] = value
+                start += width
+            
+            records.append(record)
+    finally:
+        file_handle.close()
+    
+    return records
+
+
+async def read_file(file_config: FileConfig) -> List[Dict[str, Any]]:
+    """Read file based on file type."""
+    logger.info(f"Reading file: {file_config.file_path} (type: {file_config.file_type})")
+    
+    if file_config.file_type in ["csv", "tsv"]:
+        return await read_csv_file(file_config)
+    elif file_config.file_type == "json":
+        return await read_json_file(file_config)
+    elif file_config.file_type == "fixed":
+        return await read_fixed_width_file(file_config)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_config.file_type}")
+
+
+# ============================================================================
+# TEMPORAL DATA FUNCTIONS
+# ============================================================================
+# Note: _deactivate_existing_records function has been moved to TemporalDataProcessor
+# for centralized temporal data management across all services
+
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.get("/health")
+async def health() -> Dict[str, str]:
+    """Health check endpoint."""
+    logger.debug("Health check requested")
+    return {"status": "ok", "service": SERVICE_NAME, "correlation_id": get_correlation_id()}
+
+@app.get("/health", tags=["Healthcheck"])
+def get_health_status():
+    """    Health check endpoint to verify the API is running.
+    Returns a simple status dictionary and an HTTP 200 OK.
+    """
+    return {"status": "healthy"}
+    
+@app.post("/ingest/fileload", response_model=IngestResponse)
+@limiter.limit(STRICT_RATE_LIMIT)
+async def ingest_file(
+    request: Request,
+    req: IngestRequest,
+    auth: Dict = Depends(verify_jwt_or_basic),
+    x_correlation_id: str = Header(None)
+) -> IngestResponse:
+    """
+    Ingest data from file to database with full ETL pipeline.
+    
+    This endpoint reads data from files (CSV, TSV, JSON) and loads it into a database
+    with optional JOLT transformation, Avro validation, and temporal tracking.
+    
+    Authentication:
+    ---------------
+    Requires JWT token or Basic authentication (verified by security gateway).
+    
+    Data Flow:
+    ----------
+    1. Read file (CSV/TSV/JSON)
+    2. Apply column mapping
+    3. Transform with JOLT (if provided)
+    4. Validate against target_avro_schema (if provided)
+    5. Deactivate existing records (temporal pattern)
+    6. Insert new records with asof_date and correlation_id
+    7. Publish audit events to Kafka
+    
+    Example:
+    --------
+    See FILE_TO_DB_SPECIFICATION.md for complete examples.
+    """
+    start_time = time.time()
+    total_records = 0  # Initialize to prevent UnboundLocalError in exception handler
+    
+    # Generate correlation ID and asof_date
+    # correlation_id = req.correlation_id or f"file-ingest-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    correlation_id = x_correlation_id
+    asof_date = req.asof_date or datetime.now().strftime("%Y-%m-%d")
+    
+    logger.info(
+        f"Starting File-to-DB ingestion: {req.file.file_path} -> {req.db.table_name}",
+        extra={
+            "extra_fields": {
+                "file_path": req.file.file_path,
+                "file_type": req.file.file_type,
+                "target_table": req.db.table_name,
+                "target_schema": req.db.schema_name,
+                "correlation_id": correlation_id,
+                "asof_date": asof_date,
+                "auth_user": auth.get("username") or auth.get("subject"),
+            }
+        }
+    )
+    
+    # Audit: Operation started
+    await publish_audit_event(
+        domain_id=DEFAULT_DOMAIN_ID,
+        entity_type="OPERATION",
+        entity_id=f"{req.file.file_path}->{req.db.table_name}",
+        event_type="OPERATION_STARTED",
+        outcome="INFO",
+        details=f"Starting file-to-DB ingestion from {req.file.file_path} to {req.db.table_name}",
+        payload={
+            "operation_type": "file-to-db",
+            "source": req.file.file_path,
+            "destination": req.db.table_name,
+            "correlation_id": correlation_id,
+        },
+        metadata={
+            "correlation_id": correlation_id,
+            "source": req.file.file_path,
+            "destination": req.db.table_name,
+        },
+    )
+
+    # CYBERARK-INTEGRATION: resolve ${KEY} placeholders in DB URL before connecting
+    db_url = req.db.sqlalchemy_url
+
+    if CREDENTIAL_SERVICE_URL:
+        db_url = await resolve_password_in_db_url(
+            sqlalchemy_url=req.db.sqlalchemy_url,
+            credential_service_url=CREDENTIAL_SERVICE_URL,
+            credential_source=CredentialSource.ESO,
+            correlation_id=correlation_id,
+        )
+    
+    with OPERATION_LATENCY.labels(service=SERVICE_NAME, operation="ingest").time():
+        try:
+            # Validate identifiers
+            validate_ident(req.db.table_name, "table name")
+            if req.db.schema_name:
+                validate_ident(req.db.schema_name, "schema name")
+            
+            # Read file
+            records = await read_file(req.file)
+            
+            if not records:
+                raise HTTPException(status_code=400, detail="No records found in file")
+            
+            logger.info(f"Read {len(records)} records from file")
+            
+            # Audit: Records received from file
+            correlation_id = get_correlation_id()
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="FILE",
+                entity_id=req.file.file_path,
+                event_type="RECORDS_RECEIVED",
+                outcome="SUCCESS",
+                details=f"Received {len(records)} records from {req.file.file_path}",
+                payload={"records_count": len(records), "file_type": req.file.file_type, "correlation_id": correlation_id},
+                metadata={"file_path": req.file.file_path, "file_type": req.file.file_type, "correlation_id": correlation_id},
+            )
+            
+            # engine = async_engine(req.db.sqlalchemy_url)
+            # # Create DB engine
+            # engine = async_engine(req.db.sqlalchemy_url)
+
+            # Create DB engine
+            # SECURITY: do not log resolved_db_url (contains password)
+            engine = async_engine(db_url)
+
+            # Reflect table
+            table = await reflect_table(
+                engine,
+                req.db.table_name,
+                req.db.schema_name,
+            )
+            
+            # Create database-specific writer (needed for datatype conversion)
+            db_writer = DatabaseWriterFactory.create_writer(engine, logger=logger)
+            
+            # Disable COPY for PostgreSQL to avoid psycopg2 password issues
+            if hasattr(db_writer, 'use_copy'):
+                db_writer.use_copy = False
+                logger.info(f"Using database writer: {type(db_writer).__name__} (COPY disabled, using INSERT)")
+            else:
+                logger.info(f"Using database writer: {type(db_writer).__name__}")
+            
+            # Initialize JOLT client if needed
+            jolt_client = JoltClient() if req.jolt_spec else None
+            
+            # Convert string values to appropriate types FIRST (CSV reads everything as strings)
+            # This must happen before mapping/processing so the correct types flow through
+            # Note: Type conversions should be based on mapping configuration, not hardcoded assumptions
+            
+            # Convert any non-standard data types to strings for Avro compatibility
+            # Use centralized datatype conversion from enhanced writer
+            if hasattr(db_writer, 'convert_datatypes_for_avro_compatibility'):
+                records = db_writer.convert_datatypes_for_avro_compatibility(records)
+            else:
+                # Fallback: create writer instance for conversion
+                from common.processors.db.writers.generic import GenericSQLWriter
+                fallback_writer = GenericSQLWriter(engine, logger)
+                records = fallback_writer.convert_datatypes_for_avro_compatibility(records)
+            
+            # Add temporal fields to records BEFORE processing (only if no aggregation)
+            # If aggregation is used, temporal fields are added AFTER aggregation
+            final_asof_date = req.db.asof_date or asof_date
+            if not req.aggregation_config and req.db.asof_date:
+                records = TemporalDataProcessor.inject_temporal_fields(
+                    records,
+                    asof_date=final_asof_date,
+                    asof_date_column=req.db.asof_date_column,
+                    active_column=req.db.active_column,
+                    correlation_id_column=req.db.correlation_id_column,
+                    correlation_id=correlation_id,
+                )
+            
+            # Process records using ETL pipeline (with temporal fields already added)
+            # Normalize target column names to match case-sensitive database columns
+            column_mapping = create_case_sensitive_column_mapping(table)
+            mapping_dicts = []
+            for m in req.mapping:
+                # Normalize target column name to match database case
+                target_column = m.target
+                if target_column in column_mapping:
+                    actual_target = column_mapping[target_column]
+                elif target_column.lower() in column_mapping:
+                    actual_target = column_mapping[target_column.lower()]
+                else:
+                    actual_target = target_column  # Keep original if no match
+                
+                mapping_dicts.append({
+                    "source": m.source,
+                    "target": actual_target
+                })
+            process_start = time.time()
+            processed = await ETLPipeline.process_batch(
+                records,
+                target_schema=None,  # Skip target validation until after aggregation
+                jolt_spec=req.jolt_spec,
+                mapping=mapping_dicts,
+                jolt_client=jolt_client,
+                aggregation_config=req.aggregation_config,  # 🆕 Aggregation support
+            )
+            
+            # Add temporal metadata AFTER aggregation but BEFORE target validation
+            # This is critical because target schema expects these fields to exist
+            if req.db.asof_date:
+                processed = TemporalDataProcessor.inject_temporal_fields(
+                    processed,
+                    asof_date=final_asof_date,  # Use the calculated final_asof_date
+                    asof_date_column=req.db.asof_date_column,
+                    active_column=req.db.active_column,
+                    correlation_id_column=req.db.correlation_id_column,
+                    correlation_id=correlation_id,
+                )
+            
+            # Validate against target Avro schema AFTER all processing (including aggregation and temporal injection)
+            if req.target_avro_schema:
+                from common.avro import validate_batch_list, normalize_records_for_schema
+                # Normalize union types for target schema compatibility
+                processed = normalize_records_for_schema(processed, req.target_avro_schema)
+                # Validate final data structure against target schema
+                validate_batch_list(processed, req.target_avro_schema)
+            
+            # Audit: Records processed
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="ETL_PIPELINE",
+                entity_id=f"{req.file.file_path}->{req.db.table_name}",
+                event_type="RECORDS_PROCESSED",
+                outcome="SUCCESS",
+                details=f"Processed {len(processed)} records through ETL pipeline",
+                payload={
+                    "records_count": len(processed),
+                    "has_jolt": req.jolt_spec is not None,
+                    "has_mapping": req.mapping is not None,
+                    "duration_ms": (time.time() - process_start) * 1000,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "source": req.file.file_path,
+                    "destination": req.db.table_name,
+                    "correlation_id": correlation_id,
+                },
+            )
+            
+            # TEMPORAL DATA HANDLING: Deactivate existing records if configured
+            # This implements SCD Type 2 pattern with deactivate_filter support
+            deactivated = 0
+            if req.db.asof_date and req.db.deactivate_filter is not None:
+                deactivated = await TemporalDataProcessor.deactivate_existing_records(
+                    engine=engine,
+                    table=table,
+                    asof_date=req.db.asof_date,
+                    active_column=req.db.active_column,
+                    deactivate_filter=req.db.deactivate_filter,
+                    correlation_id=correlation_id,
+                )
+                
+                if deactivated > 0:
+                    logger.info(f"Deactivated {deactivated} existing records using filter: {req.db.deactivate_filter}")
+            
+            # Normalize column names for case-sensitive database columns
+            processed = normalize_column_names_for_table(processed, table)
+            
+            # Write to database (writer already created above)
+            
+            if req.db.upsert_mode and req.db.upsert_key:
+                # Upsert mode: INSERT...ON CONFLICT (datatype conversion already done)
+                await db_writer.upsert_batch(table, processed, [req.db.upsert_key], convert_datatypes=False)
+            else:
+                # Standard insert mode: Batch INSERT (datatype conversion already done)
+                await db_writer.write_batch(table, processed, convert_datatypes=False)
+            
+            total_records = len(processed)
+            
+            # Audit: Records written
+            write_duration = int((time.time() - process_start) * 1000)
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="TABLE",
+                entity_id=f"{req.db.schema_name}.{req.db.table_name}" if req.db.schema_name else req.db.table_name,
+                event_type="RECORDS_WRITTEN",
+                outcome="SUCCESS",
+                details=f"Wrote {total_records} records to {req.db.table_name}",
+                payload={
+                    "records_count": total_records,
+                    "duration_ms": write_duration,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "table": req.db.table_name,
+                    "schema": req.db.schema_name,
+                    "correlation_id": correlation_id,
+                },
+            )
+            
+            # Metrics
+            record_batch(SERVICE_NAME, "ingest", total_records)
+            record_success(SERVICE_NAME, "ingest", total_records)
+            
+            duration_ms = int((time.time() - start_time) * 1000)
+            
+            logger.info(
+                f"File-to-DB ingestion completed successfully",
+                extra={
+                    "extra_fields": {
+                        "correlation_id": correlation_id,
+                        "total_records": total_records,
+                        "duration_ms": duration_ms,
+                        "file_path": req.file.file_path,
+                        "target_table": req.db.table_name,
+                        "records_per_second": int(total_records / (duration_ms / 1000)) if duration_ms > 0 else 0,
+                    }
+                }
+            )
+            
+            # Audit: Operation completed successfully
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="OPERATION",
+                entity_id=f"{req.file.file_path}->{req.db.table_name}",
+                event_type="OPERATION_COMPLETED",
+                outcome="SUCCESS",
+                details=f"Completed file-to-DB ingestion: {total_records} records in {duration_ms:.2f}ms",
+                payload={
+                    "operation_type": "file-to-db",
+                    "source": req.file.file_path,
+                    "destination": req.db.table_name,
+                    "records_count": total_records,
+                    "duration_ms": duration_ms,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "correlation_id": correlation_id,
+                    "source": req.file.file_path,
+                    "destination": req.db.table_name,
+                },
+            )
+            
+            return IngestResponse(
+                records=total_records,
+                duration_ms=duration_ms,
+                correlation_id=correlation_id,
+                asof_date=asof_date,
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            
+            # Audit: Operation failed
+            await publish_audit_event(
+                domain_id=DEFAULT_DOMAIN_ID,
+                entity_type="OPERATION",
+                entity_id=f"{req.file.file_path}->{req.db.table_name}",
+                event_type="OPERATION_FAILED",
+                outcome="FAILURE",
+                details=f"File-to-DB ingestion failed: {type(e).__name__}: {str(e)}",
+                payload={
+                    "operation_type": "file-to-db",
+                    "source": req.file.file_path,
+                    "destination": req.db.table_name,
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "records_processed": total_records,
+                    "duration_ms": duration_ms,
+                    "correlation_id": correlation_id,
+                },
+                metadata={
+                    "correlation_id": correlation_id,
+                    "source": req.file.file_path,
+                    "destination": req.db.table_name,
+                },
+            )
+            
+            log_error(logger, e, "ingest",
+                     file_path=req.file.file_path,
+                     target_table=req.db.table_name)
+            record_error(SERVICE_NAME, "ingest", type(e).__name__)
+            raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    logger.info(f"Starting {SERVICE_NAME} service on port {SERVICE_PORT}")
+    logger.info(f"JOLT Service URL: {JOLT_SERVICE_URL}")
+    logger.info(f"Security Gateway URL: {SECURITY_BASE_URL}")
+    logger.info(f"Audit: {'Enabled' if AUDIT_ENABLED else 'Disabled'}")
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=SERVICE_PORT,
+        log_config=None,  # Use our custom logging
+    )
